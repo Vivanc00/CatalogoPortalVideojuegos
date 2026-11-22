@@ -2,13 +2,16 @@
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
+using MySql.Data.MySqlClient;
 
 namespace CatalogoPortalVideojuegos
 {
     public partial class LoginWindow : Window
     {
-        // Usuarios en memoria: [fila, 0] = usuario, [fila, 1] = contraseña
-        private readonly string[,] usuarios = { { "admin", "1234" }, { "dam", "2026" } };
+        // Práctica 3: los usuarios ya no están en memoria, se validan contra la tabla Usuarios de MySQL.
+
+        // Código de error de MySQL para clave duplicada (UNIQUE de nombre_usuario)
+        private const int ERROR_DUPLICADO = 1062;
 
         private int intentosFallidos = 0;
         private const int MAX_INTENTOS = 3;
@@ -20,56 +23,123 @@ namespace CatalogoPortalVideojuegos
             timerBloqueo.Tick += (s, e) => DesbloquearAcceso();
         }
 
+        // TC01, TC03, TC04, TC07, TC08, TC09: inicio de sesión contra la BBDD
         private void btnLogin_Click(object sender, RoutedEventArgs e)
         {
             string user = txtUsuario.Text.Trim();
             string pass = txtPassword.Password;
 
-            // TC04: campos vacíos
+            // TC01: campos vacíos -> no se consulta la BBDD
+            if (!CamposRellenos(user, pass)) return;
+
+            MySqlConnection? conexion = null;
+            try
+            {
+                conexion = DatabaseHelper.AbrirConexion();
+
+                // Consulta parametrizada: los valores nunca se concatenan al SQL (TC09: inyección SQL)
+                const string sql = "SELECT COUNT(*) FROM Usuarios " +
+                                   "WHERE nombre_usuario = @usuario AND password = @password";
+                using var comando = new MySqlCommand(sql, conexion);
+                comando.Parameters.AddWithValue("@usuario", user);
+                comando.Parameters.AddWithValue("@password", pass);
+
+                long coincidencias = Convert.ToInt64(comando.ExecuteScalar());
+
+                // TC03 / TC07: login correcto
+                if (coincidencias == 1)
+                {
+                    intentosFallidos = 0;
+                    new MainWindow().Show();   // abre el catálogo
+                    this.Close();              // cierra el login
+                    return;
+                }
+
+                // TC04: usuario o contraseña incorrectos (no se dice cuál de los dos falla)
+                intentosFallidos++;
+                if (intentosFallidos >= MAX_INTENTOS)
+                {
+                    BloquearAcceso();
+                }
+                else
+                {
+                    Mostrar($"Usuario o contraseña incorrectos (intento {intentosFallidos}/{MAX_INTENTOS})", false);
+                    txtPassword.Clear(); txtPassword.Focus();
+                }
+            }
+            catch (MySqlException)
+            {
+                // TC08: MySQL parado -> aviso y la aplicación sigue abierta
+                Mostrar("No se puede conectar con la base de datos. Compruebe que el servidor MySQL está en marcha.", false);
+            }
+            catch (Exception ex)
+            {
+                Mostrar("Error inesperado: " + ex.Message, false);
+            }
+            finally
+            {
+                DatabaseHelper.CerrarConexion(conexion);
+            }
+        }
+
+        // TC05, TC06: alta de un usuario nuevo en la tabla
+        private void btnNuevoUsuario_Click(object sender, RoutedEventArgs e)
+        {
+            string user = txtUsuario.Text.Trim();
+            string pass = txtPassword.Password;
+
+            if (!CamposRellenos(user, pass)) return;
+
+            MySqlConnection? conexion = null;
+            try
+            {
+                conexion = DatabaseHelper.AbrirConexion();
+
+                const string sql = "INSERT INTO Usuarios (nombre_usuario, password) " +
+                                   "VALUES (@usuario, @password)";
+                using var comando = new MySqlCommand(sql, conexion);
+                comando.Parameters.AddWithValue("@usuario", user);
+                comando.Parameters.AddWithValue("@password", pass);
+                comando.ExecuteNonQuery();
+
+                // TC05: alta correcta
+                Mostrar($"Usuario '{user}' dado de alta correctamente. Ya puede iniciar sesión.", true, true);
+                txtPassword.Clear(); txtPassword.Focus();
+            }
+            catch (MySqlException ex) when (ex.Number == ERROR_DUPLICADO)
+            {
+                // TC06: el UNIQUE de nombre_usuario impide el duplicado
+                Mostrar("El usuario ya existe", false);
+                txtUsuario.Focus(); txtUsuario.SelectAll();
+            }
+            catch (MySqlException)
+            {
+                // TC08: MySQL parado
+                Mostrar("No se puede conectar con la base de datos. Compruebe que el servidor MySQL está en marcha.", false);
+            }
+            catch (Exception ex)
+            {
+                Mostrar("Error inesperado: " + ex.Message, false);
+            }
+            finally
+            {
+                DatabaseHelper.CerrarConexion(conexion);
+            }
+        }
+
+        private bool CamposRellenos(string user, string pass)
+        {
             if (user == "" || pass == "")
             {
                 Mostrar("Introduzca los datos requeridos", false);
-                return;
+                return false;
             }
-
-            // Buscar el usuario en la matriz
-            int fila = -1;
-            for (int i = 0; i < usuarios.GetLength(0); i++)
-                if (usuarios[i, 0] == user) { fila = i; break; }
-
-            // TC03: usuario inexistente
-            if (fila == -1)
-            {
-                Mostrar("El usuario introducido no existe", false);
-                txtUsuario.Clear(); txtPassword.Clear(); txtUsuario.Focus();
-                return;
-            }
-
-            // TC01: login correcto
-            if (usuarios[fila, 1] == pass)
-            {
-                intentosFallidos = 0;
-                new MainWindow().Show();   // abre el catálogo
-                this.Close();              // cierra el login
-                return;
-            }
-
-            // TC02 y TC05: contraseña incorrecta
-            intentosFallidos++;
-            if (intentosFallidos >= MAX_INTENTOS)
-            {
-                BloquearAcceso();
-            }
-            else
-            {
-                Mostrar($"La contraseña introducida no es correcta (intento {intentosFallidos}/{MAX_INTENTOS})", false);
-                txtPassword.Clear(); txtPassword.Focus();
-            }
+            return true;
         }
 
         private void BloquearAcceso()
         {
-            txtUsuario.IsEnabled = txtPassword.IsEnabled = btnLogin.IsEnabled = false;
+            txtUsuario.IsEnabled = txtPassword.IsEnabled = btnLogin.IsEnabled = btnNuevoUsuario.IsEnabled = false;
             Mostrar("Demasiados intentos. Acceso bloqueado 30 segundos.", false);
             timerBloqueo.Start();
         }
@@ -78,20 +148,23 @@ namespace CatalogoPortalVideojuegos
         {
             timerBloqueo.Stop();
             intentosFallidos = 0;
-            txtUsuario.IsEnabled = txtPassword.IsEnabled = btnLogin.IsEnabled = true;
+            txtUsuario.IsEnabled = txtPassword.IsEnabled = btnLogin.IsEnabled = btnNuevoUsuario.IsEnabled = true;
             txtPassword.Clear();
             Mostrar("Acceso desbloqueado. Inténtelo de nuevo.", true);
         }
 
-        private void Mostrar(string texto, bool ok)
+        // Muestra el mensaje en la etiqueta y, si es un error (o se pide), también por ventana
+        private void Mostrar(string texto, bool ok, bool ventana = false)
         {
             lblMensaje.Text = texto;
             lblMensaje.Foreground = ok ? Brushes.LightGreen : Brushes.IndianRed;
-            // El plan de pruebas pide "mensaje por ventana", así que también usamos MessageBox
-            if (!ok) MessageBox.Show(texto, "Aviso", MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (!ok)
+                MessageBox.Show(texto, "Aviso", MessageBoxButton.OK, MessageBoxImage.Warning);
+            else if (ventana)
+                MessageBox.Show(texto, "Información", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
-        // TC07: salir de la aplicación
+        // TC02: salir de la aplicación
         private void btnSalir_Click(object sender, RoutedEventArgs e)
         {
             Application.Current.Shutdown();
